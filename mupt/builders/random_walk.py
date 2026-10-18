@@ -1,4 +1,4 @@
-"""Utilities for generating coordinates of random walks"""
+"""Random walk coordinate generation, and builders which place chains along walks"""
 
 import logging
 
@@ -6,30 +6,28 @@ LOGGER = logging.getLogger(__name__)
 
 from typing import (
     Generator,
-    Hashable,
     Iterable,
     Optional,
     Sized,
     Union,
 )
 from numbers import Number
-from collections import defaultdict
 
 import numpy as np
 from scipy.spatial.transform import RigidTransform
-from networkx import Graph, all_simple_paths
+from networkx import connected_components
 
 from .base import PlacementGenerator
+from .unit_placement import Junction, UnitPlacement, UnitPlacer, SingleBondPlacer
 from ..mutils.iteration import flexible_iterator, sliding_window
-from ..graphs.invariants import is_branched, termini, chains
+from ..graphs.invariants import is_branched
 
-from ..geometry.arraytypes import Shape, Dims, NumericNP, Vector3
+from ..geometry.arraytypes import ArrayNx3, Shape, Dims, NumericNP, Vector3
+from ..geometry.collision import SpatialHashIndex
 from ..geometry.measure import normalized
 from ..geometry.coordinates.directions import random_unit_vector
 from ..geometry.coordinates.reference import origin
-from ..geometry.transforms.rigid import rigid_vector_coalignment
 
-from ..mupr.connection import Connector
 from ..mupr.primitives import Primitive, PrimitiveHandle
 
 
@@ -151,10 +149,308 @@ def random_walk_jointed_chain(  # noqa: C901
             break
 
 
-class AngleConstrainedRandomWalk(PlacementGenerator):
+class SelfAvoidanceError(RuntimeError):
+    """Raised when a chain cannot be placed without collisions within search limits"""
+
+
+class SelfAvoidingWalk(PlacementGenerator):
     """
-    Simple demonstration builder which places children of a Primitive
-    in a non-self-avoiding, constrained-angle random walk
+    Places the children of a Primitive one at a time along each of its linear chains,
+    optionally rejecting placements which collide with previously-placed units
+
+    How each unit is connected to and oriented relative to the previous one is
+    delegated entirely to the provided UnitPlacer; this class is responsible only
+    for traversing chains, collision checking, and backtracking out of dead ends.
+
+    Self-avoidance is enabled by providing a minimum_distance (or a pre-existing
+    collision_index, e.g. one shared between several walks). Collisions are
+    checked between the centroids of the leaves beneath each unit, all of which
+    must then have shapes. If box_lengths are also given, distances are measured
+    periodically in an orthorhombic box centered on the origin.
+    Without self-avoidance, every proposed placement is accepted
+    """
+
+    def __init__(
+        self,
+        placer: UnitPlacer,
+        initial_point: Optional[Vector3] = None,
+        rng: Optional[np.random.Generator] = None,
+        minimum_distance: Optional[float] = None,
+        box_lengths: Optional[tuple[float, float, float]] = None,
+        max_attempts_per_unit: int = 100,
+        max_backtracks: int = 1_000,
+        collision_index: Optional[SpatialHashIndex] = None,
+        occupied_sites: Optional[ArrayNx3] = None,
+    ) -> None:
+        if not isinstance(placer, UnitPlacer):
+            raise TypeError(f"Placer must be a UnitPlacer, not {type(placer)}")
+        self.placer = placer
+
+        if initial_point is not None:
+            initial_point = np.asarray(initial_point, dtype=float)
+            if initial_point.shape != (3,):
+                raise ValueError("Initial point must be a 3-dimensional vector")
+        self.initial_point = initial_point
+        self.rng = rng
+
+        self.max_attempts_per_unit = int(max_attempts_per_unit)
+        self.max_backtracks = int(max_backtracks)
+        if self.max_attempts_per_unit < 1:
+            raise ValueError("Must allow at least one placement attempt per unit")
+        if self.max_backtracks < 0:
+            raise ValueError("Maximum number of backtracks must be non-negative")
+
+        self.collision_index = self._resolve_collision_index(
+            collision_index, minimum_distance, box_lengths
+        )
+        if self.is_self_avoiding:
+            if self.collision_index.cutoff > self.placer.bond_length:
+                raise ValueError(
+                    f"Minimum distance ({self.collision_index.cutoff}) cannot exceed "
+                    f"the bond length ({self.placer.bond_length}), "
+                    "as bonded sites would then collide"
+                )
+            if occupied_sites is not None:
+                self.collision_index.add(occupied_sites)
+        elif occupied_sites is not None:
+            raise ValueError("Occupied sites require self-avoidance to be enabled")
+
+        self.placed_sites: ArrayNx3 = np.empty((0, 3), dtype=float)
+
+    @staticmethod
+    def _resolve_collision_index(
+        collision_index: Optional[SpatialHashIndex],
+        minimum_distance: Optional[float],
+        box_lengths: Optional[tuple[float, float, float]],
+    ) -> Optional[SpatialHashIndex]:
+        """The collision index to use (if any) given the self-avoidance arguments"""
+        if collision_index is not None:
+            if (minimum_distance is not None) or (box_lengths is not None):
+                raise ValueError(
+                    "Pass either a collision_index or "
+                    "minimum_distance/box_lengths, not both"
+                )
+            return collision_index
+
+        if minimum_distance is not None:
+            return SpatialHashIndex(cutoff=minimum_distance, box_lengths=box_lengths)
+
+        if box_lengths is not None:
+            raise ValueError(
+                "Periodic box_lengths require a minimum_distance to be set"
+            )
+        return None
+
+    @property
+    def is_self_avoiding(self) -> bool:
+        """Whether placements are checked for collisions"""
+        return self.collision_index is not None
+
+    # chain layout
+    @staticmethod
+    def chain_paths(primitive: Primitive) -> list[list[PrimitiveHandle]]:
+        """
+        Ordered handles of the children along each linear chain in a Primitive's
+        topology
+
+        Chains are walked starting from whichever terminal child was added to the
+        topology first, so that the direction of traversal is reproducible
+        """
+        topology = primitive.topology
+        if is_branched(topology):
+            raise ValueError("Chain builder behavior undefined for branched topologies")
+
+        insertion_order = {handle: idx for idx, handle in enumerate(topology.nodes)}
+        paths = []
+        for component_nodes in connected_components(topology):
+            ordered_nodes = sorted(component_nodes, key=insertion_order.__getitem__)
+            chain_termini = [
+                handle for handle in ordered_nodes if topology.degree[handle] <= 1
+            ]
+            if not chain_termini:
+                raise ValueError(
+                    "Chain builder behavior undefined for cyclic topologies"
+                )
+
+            path = [chain_termini[0]]
+            while len(path) < len(ordered_nodes):
+                (next_handle,) = (
+                    nb_handle
+                    for nb_handle in topology.neighbors(path[-1])
+                    if (len(path) == 1) or (nb_handle != path[-2])
+                )
+                path.append(next_handle)
+            paths.append(path)
+
+        return paths
+
+    @staticmethod
+    def chain_junctions(
+        primitive: Primitive,
+        path: list[PrimitiveHandle],
+    ) -> list[Junction]:
+        """The bonds between each consecutive pair of children along a path"""
+        return [
+            Junction(
+                from_handle=from_handle,
+                to_handle=to_handle,
+                # sorted, as connections are stored in (unordered) sets
+                connector_pairs=tuple(
+                    sorted(
+                        primitive.internal_connections_between(from_handle, to_handle)
+                    )
+                ),
+            )
+            for from_handle, to_handle in sliding_window(path, 2)
+        ]
+
+    @staticmethod
+    def unit_sites(unit: Primitive) -> ArrayNx3:
+        """Positions of all leaves beneath (or at) a unit, used for collision checks"""
+        leaves = [unit] if unit.is_leaf else unit.leaves
+        if any(leaf.shape is None for leaf in leaves):
+            raise TypeError(
+                f"All leaves beneath Primitive {unit._repr_brief()} must "
+                "have shapes to be checked for collisions"
+            )
+        return np.array([leaf.shape.centroid for leaf in leaves], dtype=float)
+
+    # implementing builder contracts
+    def check_preconditions(self, primitive: Primitive) -> None:
+        """Enforce linear chains which the placer is able to place"""
+        for path in self.chain_paths(primitive):
+            self.placer.check_preconditions(
+                primitive, path, self.chain_junctions(primitive, path)
+            )
+            if self.is_self_avoiding:
+                for handle in path:
+                    self.unit_sites(primitive.fetch_child(handle))
+
+    def _propose_initial_point(self) -> Vector3:
+        """
+        Starting point for the first unit of a chain; if none was specified,
+        drawn uniformly within the periodic box (if any), else the origin
+        """
+        if self.initial_point is not None:
+            return self.initial_point
+
+        box_lengths = (
+            self.collision_index.box_lengths if self.is_self_avoiding else None
+        )
+        if box_lengths is not None:
+            uniform = np.random.uniform if (self.rng is None) else self.rng.uniform
+            return uniform(-box_lengths / 2.0, box_lengths / 2.0)
+
+        return origin(dimension=3)
+
+    def _max_attempts(self, depth: int) -> int:
+        """Number of proposals worth making for the unit at a given depth"""
+        return self.max_attempts_per_unit if self.placer.is_stochastic(depth) else 1
+
+    def _solve_chain(
+        self,
+        primitive: Primitive,
+        path: list[PrimitiveHandle],
+        tokens: list[int],
+        site_batches: list[ArrayNx3],
+    ) -> list[UnitPlacement]:
+        """
+        Find accepted placements for every unit along one chain
+
+        Collision index tokens and sites of accepted units are appended to the
+        passed lists, which the caller is responsible for rolling back on failure
+        """
+        self.placer.prepare(primitive, path, self.chain_junctions(primitive, path))
+        template_sites: dict[PrimitiveHandle, ArrayNx3] = {}
+        if self.is_self_avoiding:
+            template_sites = {
+                handle: self.unit_sites(primitive.fetch_child(handle))
+                for handle in path
+            }
+        accepted: list[UnitPlacement] = []
+        num_tokens_prior = len(tokens)
+        attempts: list[int] = [0] * len(path)
+        num_backtracks: int = 0
+        while len(accepted) < len(path):
+            depth = len(accepted)
+            if attempts[depth] >= self._max_attempts(depth):
+                # dead end; unwind to nearest prior unit with proposals left to try
+                if num_backtracks >= self.max_backtracks:
+                    raise SelfAvoidanceError(
+                        f"Unable to place chain in {primitive._repr_brief()}; gave "
+                        f"up at unit {depth} of {len(path)} after {num_backtracks} "
+                        "backtracks"
+                    )
+                while attempts[depth] >= self._max_attempts(depth):
+                    attempts[depth] = 0
+                    if depth == 0:
+                        raise SelfAvoidanceError(
+                            f"Unable to place chain in {primitive._repr_brief()}; "
+                            "exhausted all placements of its first unit"
+                        )
+                    depth -= 1
+                    accepted.pop()
+                    self.collision_index.remove(tokens.pop())
+                    site_batches.pop()
+                num_backtracks += 1
+                LOGGER.debug(f"Backtracked to unit {depth} of {len(path)}")
+                continue
+
+            attempts[depth] += 1
+            if depth == 0:
+                candidate = self.placer.place_first(
+                    self._propose_initial_point(), rng=self.rng
+                )
+            else:
+                candidate = self.placer.place_next(depth, accepted[-1], rng=self.rng)
+
+            if self.is_self_avoiding:
+                sites = candidate.transform.apply(template_sites[candidate.handle])
+                if self.collision_index.collides(sites):
+                    continue
+                tokens.append(self.collision_index.add(sites))
+                site_batches.append(sites)
+            accepted.append(candidate)
+        assert (not self.is_self_avoiding) or (
+            len(tokens) - num_tokens_prior == len(path)
+        ), "Collision bookkeeping out of sync with accepted placements"
+
+        return accepted
+
+    def _generate_placements(
+        self, primitive: Primitive
+    ) -> Generator[tuple[PrimitiveHandle, RigidTransform], None, None]:
+        """
+        Place every chain in the Primitive before yielding any placements, so that
+        a failure to place any one chain leaves the collision index untouched
+        """
+        tokens: list[int] = []
+        site_batches: list[ArrayNx3] = []
+        chain_placements: list[list[UnitPlacement]] = []
+        try:
+            for path in self.chain_paths(primitive):
+                chain_placements.append(
+                    self._solve_chain(primitive, path, tokens, site_batches)
+                )
+        except BaseException:
+            for token in tokens:
+                self.collision_index.remove(token)
+            raise
+
+        self.placed_sites = (
+            np.vstack(site_batches) if site_batches else np.empty((0, 3), dtype=float)
+        )
+        for placements in chain_placements:
+            self.placer.finalize(primitive, placements)
+            for placement in placements:
+                yield placement.handle, placement.transform
+
+
+class AngleConstrainedRandomWalk(SelfAvoidingWalk):
+    """
+    Places children of a Primitive joined by single bonds along an angle-constrained
+    random walk; non-self-avoiding unless a minimum_distance or collision_index is
+    passed (see SelfAvoidingWalk for the self-avoidance keyword arguments)
     """
 
     def __init__(
@@ -164,166 +460,30 @@ class AngleConstrainedRandomWalk(PlacementGenerator):
         initial_point: Optional[Vector3] = None,
         initial_direction: Optional[Vector3] = None,
         rng: Optional[np.random.Generator] = None,
+        **walk_kwargs,
     ) -> None:
-        self.bond_length = bond_length
-        self.angle_max_rad = angle_max_rad
-        self.initial_point = initial_point
-        self.initial_direction = initial_direction
-        self.rng = rng
+        super().__init__(
+            placer=SingleBondPlacer(
+                bond_length=bond_length,
+                angle_max_rad=angle_max_rad,
+                initial_direction=initial_direction,
+            ),
+            initial_point=initial_point,
+            rng=rng,
+            **walk_kwargs,
+        )
 
-    # optional helper methods (to declutter casework from main logic)
-    def get_termini_handles(self, chain: Graph) -> tuple[Hashable, Hashable]:
-        """
-        Find the terminal node(s) of what is assumed to be a linear (path) graph
+    @property
+    def bond_length(self) -> float:
+        """Target distance between the anchors of bonded units"""
+        return self.placer.bond_length
 
-        Returns the pair of node labels of the termini, i.e.
-        a pair of the same value twice for single-node graphs
-        """
-        chain_ends = tuple(termini(chain))
-        if len(chain_ends) == 2:
-            return chain_ends
-        elif len(chain_ends) == 1:
-            # for isolated nodes, return the same node twice
-            return chain_ends[0], chain_ends[0]
-        else:
-            raise ValueError(
-                "Unbranched topology must have either 1 or 2 terminal nodes"
-            )
+    @property
+    def angle_max_rad(self) -> float:
+        """Maximum angle between consecutive walk steps"""
+        return self.placer.angle_max_rad
 
-    # implementing builder contracts
-    def check_preconditions(self, primitive: Primitive) -> None:
-        """Enforce that no branches chains exist anywhere"""
-        if is_branched(primitive.topology):
-            raise ValueError(
-                "Random walk chain builder behavior undefined for branched topologies"
-            )
-
-        if any((subprim.shape is None) for subprim in primitive.children):
-            raise TypeError(
-                "Random walk chain builder requires ellipsoidal "
-                "or spherical beads to determine step sizes"
-            )
-
-    def _generate_placements(
-        self, primitive: Primitive
-    ) -> Generator[tuple[PrimitiveHandle, RigidTransform], None, None]:
-        """
-        Reorient bodies to be coincident (along a predefined axis) with
-        the steps of an angle-constrained non-self-avoiding random walk
-        """
-        for chain in chains(primitive.topology):
-            # DEV: taking extra care to ensure chain is oriented from end-to-end,
-            # because there's no requirement (or indeed, reason to believe)
-            # that the order of nodes in chain.nodes is meaningful
-            head_handle, tail_handle = self.get_termini_handles(chain)
-            path: list[PrimitiveHandle] = next(
-                all_simple_paths(chain, source=head_handle, target=tail_handle)
-            )  # raise StopIteration if no path exists
-
-            # determine pair of anchor points per-body that alignment is based upon
-            connection_points: dict[PrimitiveHandle, list[np.ndarray]] = defaultdict(
-                list
-            )
-
-            connection_points[head_handle].append(
-                primitive.children_by_handle[head_handle].shape.centroid
-            )
-            for prim_handle_outgoing, prim_handle_incoming in sliding_window(path, 2):
-                conn_handle_outgoing, conn_handle_incoming = (
-                    primitive.internal_connection_between(
-                        from_child_handle=prim_handle_outgoing,
-                        to_child_handle=prim_handle_incoming,
-                    )
-                )
-                # NOTE: traversal in-path-order is what guarantees
-                # these appends place everything in the correct order
-                conn_outgoing = primitive.fetch_connector_on_child(
-                    prim_handle_outgoing,
-                    conn_handle_outgoing,
-                )
-                # will raise Exception is anchor position is unset
-                connection_points[prim_handle_outgoing].append(
-                    conn_outgoing.anchor.position
-                )
-
-                conn_incoming = primitive.fetch_connector_on_child(
-                    prim_handle_incoming,
-                    conn_handle_incoming,
-                )
-                # will raise Exception is anchor position is unset
-                connection_points[prim_handle_incoming].append(
-                    conn_incoming.anchor.position
-                )
-
-                # align linkers w/ other's anchor while
-                # leaving anchors themselves undisturbed
-                Connector.mutually_antialign_ballistically(
-                    conn_outgoing,
-                    conn_incoming,
-                )
-
-            # NOTE: order is critical here; only placing tail point
-            # AFTER its incoming connection point is inserted
-            connection_points[tail_handle].append(
-                primitive.children_by_handle[tail_handle].shape.centroid
-            )
-
-            # extract step sizes from connection points;
-            # by design, makes no reference to the shape of the body
-            step_sizes: list[float] = []
-
-            # iterating over path, rather than
-            # connection_points.items(), to guarantee traversal order
-            for handle in path:
-                conn_start, conn_end = connection_points[handle]
-                # step longer to account for target bond length
-                step_sizes.append(
-                    np.linalg.norm(conn_end - conn_start) + self.bond_length
-                )
-
-            # generate random walk steps and corresponding placements
-            rw_steps: Generator[np.ndarray, None, None] = random_walk_jointed_chain(
-                step_size=step_sizes,
-                # not strictly necessary, suppresses "indeterminate num steps" warnings
-                n_steps_max=len(path),
-                initial_point=self.initial_point,
-                initial_direction=self.initial_direction,
-                clip_angle=self.angle_max_rad,
-                dimension=3,
-                rng=self.rng,
-            )
-            for handle, (step_start, step_end) in zip(
-                path,
-                sliding_window(rw_steps, 2),
-            ):
-                LOGGER.debug(
-                    f"Random walk placing body {handle} "
-                    f"along vector from {step_start} to {step_end}"
-                )
-                conn_start, conn_end = connection_points[handle]
-                # NOTE: no need for special case at termini, since the step size
-                # matches the half-body (e.g. center-to-anchor) step size
-                t_body = 0.5
-
-                full_step_len = np.linalg.norm(step_end - step_start)
-                # scale back to account for bond length being included in step size
-                step_correction = 1 / (1 + (self.bond_length / full_step_len))
-                # adjust step fraction to account for bond length (will always be
-                # strictly smaller than 0.5, since ratio of lengths is positive)
-                t_step = 0.5 * step_correction
-
-                placement_transform = rigid_vector_coalignment(
-                    # vector 1: spans between anchors of connection point on body
-                    conn_start,
-                    conn_end,
-                    # vector 2: spans between consecutive random walk steps
-                    step_start,
-                    step_end,
-                    # interpolation parameters for which point on
-                    # respective vectors will be forced exactly-coexistent
-                    ## take midpoint (or end, if at termini) of body-anchoring vector
-                    t1=t_body,
-                    ## ...to midpoint of random walk step vector
-                    t2=t_step,
-                )
-                yield handle, placement_transform
+    @property
+    def initial_direction(self) -> Optional[Vector3]:
+        """Direction about which the first walk step is drawn (random if None)"""
+        return self.placer.initial_direction

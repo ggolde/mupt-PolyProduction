@@ -353,26 +353,32 @@ class Primitive(NodeMixin, RigidlyTransformable):
         Collections of all connected pairs of child Connections, identified by the
         handle of the child they're attached to and the Connector handle on that child
 
-        Each entry corresponds 1-to-1 with an edge in the topology
+        Each entry corresponds to exactly one edge in the topology, though
+        a single edge may correspond to several entries (i.e. when a pair
+        of children is joined by more than one bond, as in ladder polymers)
         """
         return self._internal_connections
 
     @property
     def internal_connections_by_pairs(
         self,
-    ) -> dict[frozenset[PrimitiveHandle], frozenset[ConnectorReference]]:
+    ) -> dict[frozenset[PrimitiveHandle], set[frozenset[ConnectorReference]]]:
         """
-        Map from unordered pairs of child Primitive handles to unordered pairs
-        of Connector references between that pair of children
+        Map from unordered pairs of child Primitive handles to the set of all
+        unordered pairs of Connector references between that pair of children
+
+        Pairs of children joined by multiple bonds map to multiple Connector pairs,
+        while the topology retains only a single edge between those children
         """
-        # NOTE: prevents more than one pair between given children,
-        # enforcing a "no-multigraph" attitude
-        return {
-            frozenset(
-                conn_ref.primitive_handle for conn_ref in connected_pair
-            ): connected_pair
-            for connected_pair in self._internal_connections
-        }
+        pairs: dict[frozenset[PrimitiveHandle], set[frozenset[ConnectorReference]]] = (
+            defaultdict(set)
+        )
+        for connected_pair in self._internal_connections:
+            pairs[
+                frozenset(conn_ref.primitive_handle for conn_ref in connected_pair)
+            ].add(connected_pair)
+
+        return dict(pairs)
 
     @property
     def num_internal_connections(self) -> int:
@@ -412,27 +418,59 @@ class Primitive(NodeMixin, RigidlyTransformable):
 
         return paired_connectors
 
+    def internal_connections_between(
+        self,
+        from_child_handle: PrimitiveHandle,
+        to_child_handle: PrimitiveHandle,
+    ) -> list[tuple[ConnectorHandle, ConnectorHandle]]:
+        """
+        Fetch ALL ORDERED pairs of Connectors making up internal
+        connections between two given child Primitives.
+        I.e. reversing the order of input Primitive labels
+        correspondingly reverses the order within each pair of Connector handles
+
+        Returns a list (empty if the children are not connected) of tuples of the form :
+        (from_child's connector handle, to_child's connector handle)
+        """
+        return [
+            (from_child_conn_handle, conn_ref.connector_handle)
+            for from_child_conn_handle, conn_ref in self.internal_connections_on_child(
+                from_child_handle
+            ).items()
+            if conn_ref.primitive_handle == to_child_handle
+        ]
+
     def internal_connection_between(
         self,
         from_child_handle: PrimitiveHandle,
         to_child_handle: PrimitiveHandle,
     ) -> tuple[ConnectorHandle, ConnectorHandle]:
         """
-        Fetch the ORDERED pair of Connectors making up an
+        Fetch the ORDERED pair of Connectors making up the single
         internal connection between two given child Primitives.
         I.e. reversing the order of input Primitive labels
         correspondingly reversed the order of output Connectors handles
 
         Returns a tuple of the form :
         (from_child's connector handle, to_child's connector handle)
+        or an empty tuple if the children are not connected
+
+        Raises ValueError if the children are joined by more than one
+        connection; use internal_connections_between() for such cases
         """
-        for from_child_conn_handle, conn_ref in self.internal_connections_on_child(
-            from_child_handle
-        ).items():
-            if conn_ref.primitive_handle == to_child_handle:
-                return (from_child_conn_handle, conn_ref.connector_handle)
-        else:
+        conn_handle_pairs = self.internal_connections_between(
+            from_child_handle, to_child_handle
+        )
+        if len(conn_handle_pairs) > 1:
+            raise ValueError(
+                f"Child Primitives '{from_child_handle}' and '{to_child_handle}' "
+                f"are joined by {len(conn_handle_pairs)} internal connections; "
+                "use internal_connections_between() to fetch all of them"
+            )
+        elif not conn_handle_pairs:
             return tuple()
+
+        return conn_handle_pairs[0]
 
     def num_internal_connections_on_child(self, child_handle: PrimitiveHandle) -> int:
         """
@@ -694,13 +732,14 @@ class Primitive(NodeMixin, RigidlyTransformable):
             )
 
         # 2) check topology
-        if (
-            child_degree := self.topology.degree[primitive_handle]
-        ) != num_internal_on_child:
+        # NOTE: compares against number of distinct neighbors, rather than number of
+        # internal connections, since several bonds to one neighbor share one edge
+        num_neighbors = len(self.neighbor_handles(primitive_handle))
+        if (child_degree := self.topology.degree[primitive_handle]) != num_neighbors:
             raise BijectionError(
-                f"Primitive '{primitive_handle}' has {num_internal_on_child} "
-                f"registered internal connections versus {child_degree} "
-                "internal connections suggested by topology"
+                f"Primitive '{primitive_handle}' has {num_neighbors} "
+                f"internally-connected neighbors versus {child_degree} "
+                "neighbors suggested by topology"
             )
 
     # Child Primitives
@@ -948,27 +987,36 @@ class Primitive(NodeMixin, RigidlyTransformable):
         child_2_handle: PrimitiveHandle,
     ) -> None:
         """
-        Disconnect all internal connections between a pair
-        of children, making the associated Connectors external
+        Disconnect all internal connections between a pair of children,
+        making the associated Connectors external and removing the
+        edge between those children from the topology
         """
         assert child_1_handle != child_2_handle, (
             "Cannot disconnect a Primitive from itself"
         )
-        internal_conn_ref = self.internal_connections_by_pairs.get(
+        internal_conn_refs = self.internal_connections_by_pairs.get(
             frozenset((child_1_handle, child_2_handle)), None
         )
-        if internal_conn_ref is None:
+        if not internal_conn_refs:
             LOGGER.warning(
                 "No internal connections exist between "
                 "the given pair of children; nothing to disconnect"
             )
             return
 
-        self._internal_connections.remove(internal_conn_ref)
-        for conn_ref in internal_conn_ref:
-            self.bind_external_connector(
-                conn_ref.primitive_handle,
-                conn_ref.connector_handle,
+        for internal_conn_ref in internal_conn_refs:
+            self._internal_connections.remove(internal_conn_ref)
+            for conn_ref in internal_conn_ref:
+                self.bind_external_connector(
+                    conn_ref.primitive_handle,
+                    conn_ref.connector_handle,
+                )
+
+        if self.topology.has_edge(child_1_handle, child_2_handle):
+            self.topology.remove_edge(child_1_handle, child_2_handle)
+            LOGGER.debug(
+                f"Removed edge between child Primitives '{child_1_handle}' and "
+                f"'{child_2_handle}' in topology of {self._repr_brief()}"
             )
 
     # Search
@@ -1025,16 +1073,13 @@ class Primitive(NodeMixin, RigidlyTransformable):
         topology: Graph,
     ) -> None:
         """
-        Verify that a 1:1 correspondence exists between the internal connections
-        I.e. Connectors paired between sibling child Primitives
-        and the edges present in the incidence topology
-        """
-        if topology.number_of_edges() != self.num_internal_connections:
-            raise BijectionError(
-                f"Cannot bijectively map {self.num_internal_connections} internal "
-                f"connections onto {topology.number_of_edges()}-edge topology"
-            )
+        Verify that a 1:1 correspondence exists between the pairs of internally-
+        connected sibling child Primitives and the edges present in the topology
 
+        I.e. every edge must be backed by at least one internal connection (pair of
+        Connectors), and every internally-connected pair of children must be an edge.
+        Several internal connections between the same pair of children share one edge
+        """
         edge_labels = set(
             frozenset(edge) for edge in topology.edges
         )  # cast to frozenset to remove order-dependence
@@ -1042,10 +1087,11 @@ class Primitive(NodeMixin, RigidlyTransformable):
         if edge_labels != internal_conn_pairs:
             raise BijectionError(
                 f"Incident pairs in associated topology do not correspond "
-                "to internally-connected pairs of child Primitives;"
+                "to internally-connected pairs of child Primitives; "
                 f"{len(edge_labels - internal_conn_pairs)} edge(s) have no "
-                "corresponding connection and {len(internal_conn_pairs - edge_labels)} "
-                "internal connection(s) are unrepresented in the topology"
+                "corresponding connection and "
+                f"{len(internal_conn_pairs - edge_labels)} "
+                "internally-connected pair(s) are unrepresented in the topology"
             )
 
     def check_topology_compatible(self, topology: Optional[Graph] = None) -> None:
@@ -1091,6 +1137,9 @@ class Primitive(NodeMixin, RigidlyTransformable):
         Deduction of pairs may require more than the default number of
         iterations of the registration algorithm to finish converging;
         If registration fails the first time, try increasing max_registration_iter
+
+        Only one internal connection is deduced per edge; multiply-bonded
+        pairs of children must be connected with connect_children() instead
         """
         if not isinstance(new_topology, Graph):
             raise TypeError(f"Invalid topology type {type(new_topology)}")
@@ -1145,6 +1194,10 @@ class Primitive(NodeMixin, RigidlyTransformable):
         and will choose first available pair if multiple options exist
         Much coarser and less reliable than individually specifying
         connections, though more expedient for testing/demos
+
+        Infers exactly one pair of Connectors per edge; pairs of children joined by
+        multiple bonds (e.g. ladder polymers) must be connected explicitly
+        via repeated calls to connect_children() instead
         """
         self.check_children_bijective_to_topology_nodes(topology)
         LOGGER.warning(

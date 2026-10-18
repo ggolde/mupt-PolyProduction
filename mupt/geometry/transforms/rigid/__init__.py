@@ -15,7 +15,11 @@ from .rotations import (
     rodrigues as rodrigues,
     alignment_rotation as alignment_rotation,
 )
-from .alignment import rigid_vector_coalignment as rigid_vector_coalignment
+from .alignment import (
+    rigid_vector_coalignment as rigid_vector_coalignment,
+    rigid_junction_docking as rigid_junction_docking,
+    hinge_rotation as hinge_rotation,
+)
 
 
 def random_rigid_transformation(translation_bound: float = 0.0) -> RigidTransform:
