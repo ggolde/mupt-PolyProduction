@@ -341,6 +341,12 @@ def test_uniform_chain_length_plan_uses_density_and_explicit_box():
         ("log_write_freq", 0, "log_write_freq"),
         ("epsilon_reference_mode", "not-a-number", "epsilon_reference_mode"),
         ("nlist_exclusions", ("unsupported",), "nlist_exclusions"),
+        ("stereo_centers", "chiral_only", "stereo_centers"),
+        ("stereo_on_failure", "ignore", "stereo_on_failure"),
+        ("stereo_restraint_k", 0.0, "stereo_restraint_k"),
+        ("stereo_restraint_k", np.inf, "stereo_restraint_k"),
+        ("stereo_planar_tolerance", 0.0, "stereo_planar_tolerance"),
+        ("stereo_planar_tolerance", 1.0, "stereo_planar_tolerance"),
     ],
 )
 def test_rejects_invalid_settings(field, value, match):
@@ -948,3 +954,347 @@ def test_write_positions_updates_atoms_and_parent_shapes():
     np.testing.assert_allclose(residue.shape.centroid, expected_centroid)
     np.testing.assert_allclose(segment.shape.centroid, expected_centroid)
     np.testing.assert_allclose(root.shape.centroid, expected_centroid)
+
+
+# stereochemistry preservation (MuPT-hub/mupt#116)
+AA_DPD_DEPS_MISSING = any(
+    importlib.util.find_spec(name) is None for name in ("hoomd", "openff", "freud")
+)
+requires_aa_dpd_deps = pytest.mark.skipif(
+    AA_DPD_DEPS_MISSING, reason="AA-DPD build requires HOOMD, OpenFF and freud"
+)
+PP_ISOTACTIC = ["head"] + ["mid"] * 10 + ["tail"]
+PP_SYNDIOTACTIC = ["head"] + ["mid", "mid_inverted"] * 5 + ["tail"]
+
+
+def _polypropylene(sequence):
+    from mupt.tests.chemistry.test_stereo import (
+        backbone_methines,
+        polypropylene_universe,
+    )
+
+    root, resname_map = polypropylene_universe(sequence)
+    return root, resname_map, backbone_methines(root)
+
+
+def _stereo_reference(centers):
+    """StereoReference with the given (atom, neighbors, phi0) centers"""
+    from mupt.chemistry.stereo import Stereocenter, StereoReference
+
+    return StereoReference(
+        elements=("C",) * 16,
+        centers=tuple(
+            Stereocenter(atom, neighbors, 1, 0.5, phi0)
+            for atom, neighbors, phi0 in centers
+        ),
+    )
+
+
+class _Container:
+    def __init__(self, n=0, types=("default",), group=None, typeid=None):
+        self.N = n
+        self.types = list(types)
+        self.group = np.zeros((0, 4), np.uint32) if group is None else group
+        self.typeid = np.zeros(0, np.uint32) if typeid is None else typeid
+
+
+def test_append_stereo_dihedrals_keeps_existing_groups():
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder, AllAtomDPDSettings
+
+    frame = type("Frame", (), {})()
+    frame.dihedrals = _Container(
+        n=2,
+        types=["openff_a", "openff_b"],
+        group=np.array([[0, 1, 2, 3], [1, 2, 3, 4]], np.uint32),
+        typeid=np.array([0, 1], np.uint32),
+    )
+    reference = _stereo_reference([
+        (5, (6, 7, 8, 9), np.radians(60.2)),
+        (10, (11, 12, 13, 14), np.radians(59.9)),  # same 1-degree bin
+        (15, (1, 2, 3, 4), np.radians(300.0)),
+    ])
+    builder = AllAtomDPDBuilder(settings=AllAtomDPDSettings(stereo_restraint_k=123.0))
+    params = builder._append_stereo_dihedrals(frame, reference)
+
+    container = frame.dihedrals
+    assert container.N == 5
+    assert container.types == [
+        "openff_a",
+        "openff_b",
+        "stereo_restraint_060",
+        "stereo_restraint_300",
+    ]
+    np.testing.assert_array_equal(container.group[:2], [[0, 1, 2, 3], [1, 2, 3, 4]])
+    np.testing.assert_array_equal(
+        container.group[2:], [[6, 7, 8, 9], [11, 12, 13, 14], [1, 2, 3, 4]]
+    )
+    np.testing.assert_array_equal(container.typeid, [0, 1, 2, 2, 3])
+    assert params == {
+        "stereo_restraint_060": {"k": 123.0, "d": -1, "n": 1, "phi0": np.radians(60)},
+        "stereo_restraint_300": {"k": 123.0, "d": -1, "n": 1, "phi0": np.radians(300)},
+    }
+    assert AllAtomDPDBuilder._stereo_restraint_count(container) == 3
+
+
+def test_append_stereo_dihedrals_replaces_empty_placeholder_type():
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder
+
+    frame = type("Frame", (), {})()
+    frame.dihedrals = _Container()
+    reference = _stereo_reference([(5, (6, 7, 8, 9), np.radians(359.7))])
+    params = AllAtomDPDBuilder()._append_stereo_dihedrals(frame, reference)
+
+    assert frame.dihedrals.types == ["stereo_restraint_000"]  # 359.7 rounds to 0
+    assert frame.dihedrals.N == 1
+    assert list(params) == ["stereo_restraint_000"]
+
+
+def test_append_stereo_dihedrals_without_centers_is_a_no_op():
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder
+
+    frame = type("Frame", (), {})()
+    frame.dihedrals = _Container()
+    params = AllAtomDPDBuilder()._append_stereo_dihedrals(frame, _stereo_reference([]))
+    assert params == {}
+    assert frame.dihedrals.N == 0 and frame.dihedrals.types == ["default"]
+
+
+def test_energy_diagnostics_count_stereo_restraints_separately():
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder
+
+    class Frame:
+        bonds = _Container()
+        angles = _Container()
+        impropers = _Container()
+        dihedrals = _Container(
+            n=3,
+            types=["openff_a", "stereo_restraint_120"],
+            typeid=np.array([0, 1, 1], np.uint32),
+        )
+
+    class Simulation:
+        operations = type("Operations", (), {"integrator": None})()
+
+    diagnostics = AllAtomDPDBuilder._energy_diagnostics(Simulation(), Frame())
+    assert diagnostics["counts"]["dihedral"] == 1
+    assert diagnostics["counts"]["stereo_restraint"] == 2
+
+
+def test_simulation_uses_stereo_params_without_openff_dihedrals():
+    from mupt.builders.all_atom_dpd import (
+        AllAtomDPDBuilder,
+        AllAtomDPDSettings,
+        _ParameterTables,
+    )
+
+    class Recorder:
+        def __init__(self, *args, **kwargs):
+            self.params = {}
+
+    class FakeIntegrator:
+        def __init__(self, dt):
+            self.forces = []
+            self.methods = []
+
+    class FakeSimulation:
+        def __init__(self, device, seed):
+            self.operations = type(
+                "Operations", (), {"integrator": None, "writers": []}
+            )()
+
+        def create_state_from_snapshot(self, frame):
+            pass
+
+    class FakeHoomd:
+        filter = type("filter", (), {"All": lambda: object()})
+        device = type("device", (), {"CPU": staticmethod(lambda: "cpu")})
+        Simulation = FakeSimulation
+        md = type(
+            "md",
+            (),
+            {
+                "Integrator": FakeIntegrator,
+                "methods": type("methods", (), {"ConstantVolume": Recorder}),
+                "nlist": type("nlist", (), {"Cell": Recorder}),
+                "pair": type("pair", (), {"DPD": Recorder}),
+                "dihedral": type("dihedral", (), {"Periodic": Recorder}),
+            },
+        )
+
+    class Frame:
+        particles = type("Particles", (), {"types": ["C"]})()
+        dihedrals = _Container(n=1, types=["stereo_restraint_045"])
+
+    stereo_params = {
+        "stereo_restraint_045": {"k": 7.0, "d": -1, "n": 1, "phi0": np.pi / 4}
+    }
+    builder = AllAtomDPDBuilder(settings=AllAtomDPDSettings(device="CPU"))
+    simulation = builder._simulation(
+        FakeHoomd,
+        Frame(),
+        [],
+        [],
+        [],  # no OpenFF dihedrals
+        [],
+        _ParameterTables(epsilon_by_type={"C": 1.0}),
+        stereo_params=stereo_params,
+    )
+    (dihedral_force,) = [
+        force
+        for force in simulation.operations.integrator.forces
+        if "stereo_restraint_045" in force.params
+    ]
+    assert dihedral_force.params == stereo_params
+
+
+def test_capture_stereo_reference_selects_centers():
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder, AllAtomDPDSettings
+
+    root, resname_map, methines = _polypropylene(["head", "mid", "mid", "tail"])
+    for mode, expected in [
+        ("stereocenters", methines),
+        ("all_tetrahedral", None),
+    ]:
+        builder = AllAtomDPDBuilder(
+            settings=AllAtomDPDSettings(resname_map=resname_map, stereo_centers=mode)
+        )
+        records = builder._segment_records(root)
+        atoms = [atom for record in records for atom in record.atoms]
+        bonds = [
+            tuple(sorted((record.local_to_global[i], record.local_to_global[j])))
+            for record in records
+            for i, j in record.bonds
+        ]
+        reference = builder._capture_stereo_reference(root, records, atoms, bonds)
+        centers = [center.atom for center in reference.centers]
+        if expected is None:  # every 4-coordinate atom
+            degrees = np.bincount(np.array(bonds).ravel(), minlength=len(atoms))
+            expected = [idx for idx, degree in enumerate(degrees) if degree == 4]
+        assert centers == expected
+        assert all(0.0 <= center.phi0 < 2 * np.pi for center in reference.centers)
+
+
+def test_capture_stereo_reference_skips_undercoordinated_stereocenters(caplog):
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder, AllAtomDPDSettings
+
+    # chain ending on an uncapped mid residue: its methine keeps an unbonded linker
+    root, resname_map, methines = _polypropylene(["head", "mid", "mid"])
+    builder = AllAtomDPDBuilder(settings=AllAtomDPDSettings(resname_map=resname_map))
+    records = builder._segment_records(root)
+    atoms = [atom for record in records for atom in record.atoms]
+    bonds = [
+        tuple(sorted((record.local_to_global[i], record.local_to_global[j])))
+        for record in records
+        for i, j in record.bonds
+    ]
+    with caplog.at_level(logging.WARNING, logger="mupt.builders.all_atom_dpd"):
+        reference = builder._capture_stereo_reference(root, records, atoms, bonds)
+    assert [center.atom for center in reference.centers] == methines
+    assert "cannot preserve stereocenter" in caplog.text
+
+
+def test_initial_placement_preserves_stereocenters():
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder
+    from mupt.chemistry.stereo import capture_stereo, check_stereo
+
+    root, _, methines = _polypropylene(["head", "mid", "mid", "mid", "tail"])
+    assert len(methines) == 4  # stereocenters spanning residue junctions
+    reference = capture_stereo(root, centers=methines)
+
+    builder = AllAtomDPDBuilder()
+    records = builder._segment_records(root)
+    box_lengths = np.full(3, 30.0)
+    for seed in range(10):
+        positions = builder._initial_positions(
+            records, box_lengths, np.random.default_rng(seed)
+        )
+        assert check_stereo(positions, reference, box_lengths=box_lengths).passed
+
+
+@requires_aa_dpd_deps
+@pytest.mark.parametrize(
+    "sequence, stereo_centers",
+    [
+        (PP_ISOTACTIC, "stereocenters"),
+        (PP_ISOTACTIC, "all_tetrahedral"),
+        (PP_SYNDIOTACTIC, "stereocenters"),
+    ],
+)
+def test_build_preserves_stereocenters(sequence, stereo_centers):
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder, AllAtomDPDSettings
+    from mupt.chemistry.stereo import capture_stereo, check_stereo
+
+    inverted = {}
+    for seed in range(10):
+        root, resname_map, methines = _polypropylene(sequence)
+        reference = capture_stereo(root, centers=methines)
+        settings = AllAtomDPDSettings(
+            random_seed=seed,
+            resname_map=resname_map,
+            device="CPU",
+            preserve_stereo=True,
+            stereo_centers=stereo_centers,
+            # an occasional CH2 flip is tolerated; only real stereocenters count
+            stereo_on_failure="warn",
+        )
+        result = AllAtomDPDBuilder(settings=settings).build(root)
+        assert result.diagnostics["stereo"]["n_centers"] >= len(methines)
+        assert "stereo_inverted" in result.diagnostics
+        report = check_stereo(root, reference)
+        if not report.passed:
+            inverted[seed] = report.inverted + report.near_planar
+    assert not inverted, f"stereocenters inverted by seed: {inverted}"
+
+
+@requires_aa_dpd_deps
+def test_build_without_stereo_preservation_reports_nothing():
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder, AllAtomDPDSettings
+
+    root, resname_map, _ = _polypropylene(["head", "mid", "tail"])
+    settings = AllAtomDPDSettings(random_seed=0, resname_map=resname_map, device="CPU")
+    result = AllAtomDPDBuilder(settings=settings).build(root)
+    assert "stereo" not in result.diagnostics
+    assert "stereo_inverted" not in result.diagnostics
+    assert "stereo_restraint" not in result.diagnostics["counts"]
+
+
+@requires_aa_dpd_deps
+def test_build_stereo_failure_policy(caplog):
+    from mupt.builders.all_atom_dpd import AllAtomDPDBuilder, AllAtomDPDSettings
+    from mupt.chemistry.stereo import StereoInversionError
+
+    def settings(seed, on_failure):
+        return AllAtomDPDSettings(
+            random_seed=seed,
+            resname_map=resname_map,
+            device="CPU",
+            preserve_stereo=True,
+            stereo_restraint_k=1e-6,  # too weak to hold any center
+            stereo_on_failure=on_failure,
+        )
+
+    # find a seed whose (effectively unrestrained) build inverts a stereocenter
+    for seed in range(20):
+        root, resname_map, _ = _polypropylene(PP_ISOTACTIC)
+        before = np.array([leaf.shape.centroid for leaf in root.leaves])
+        try:
+            AllAtomDPDBuilder(settings=settings(seed, "raise")).build(root)
+        except StereoInversionError as error:
+            assert not error.report.passed
+            assert error.result.diagnostics["stereo"]["passed"] is False
+            # coordinates of the wrong molecule are never written
+            after = np.array([leaf.shape.centroid for leaf in root.leaves])
+            np.testing.assert_array_equal(after, before)
+            break
+    else:
+        pytest.fail("no seed inverted a stereocenter without a restraint")
+
+    root, resname_map, _ = _polypropylene(PP_ISOTACTIC)
+    with caplog.at_level(logging.WARNING, logger="mupt.builders.all_atom_dpd"):
+        result = AllAtomDPDBuilder(settings=settings(seed, "warn")).build(root)
+    assert result.diagnostics["stereo"]["passed"] is False
+    assert "did not preserve stereochemistry" in caplog.text
+    assert (
+        root.metadata["all_atom_dpd_summary"]["diagnostics"]["stereo"]
+        == (result.diagnostics["stereo"])
+    )
