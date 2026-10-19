@@ -46,6 +46,14 @@ import numpy as np
 
 from .base import PlacementGenerator
 from .random_walk import AngleConstrainedRandomWalk
+from ..chemistry.stereo import (
+    StereoInversionError,
+    StereoReference,
+    StereoReport,
+    capture_stereo,
+    check_stereo,
+    potential_stereocenters,
+)
 from ..geometry.shapes import PointCloud
 from ..interfaces._shared.topology import (
     build_saamr_role_topology_index,
@@ -60,6 +68,11 @@ LOGGER = logging.getLogger(__name__)
 ## TB: these should be sourced from a units package or scipy.constants
 AMU_TO_G = 1.66053906660e-24
 ANGSTROM3_TO_CM3 = 1.0e-24
+
+# HOOMD dihedral type name prefix for stereochemistry restraints
+STEREO_RESTRAINT_TYPE_PREFIX = "stereo_restraint_"
+STEREO_CENTER_MODES: tuple[str, ...] = ("stereocenters", "all_tetrahedral")
+STEREO_FAILURE_MODES: tuple[str, ...] = ("raise", "warn")
 
 
 @dataclass
@@ -122,7 +135,10 @@ class AllAtomDPDSettings:
         HOOMD neighbor-list exclusions for the DPD pair force. The default
         excludes directly bonded, 1-3, and 1-4 intramolecular pairs so the DPD
         packing force does not fight local bonded geometry during dense all-atom
-        initialization.
+        initialization. Stereochemistry restraints are dihedral groups too, so
+        ``"dihedral"`` also excludes the pair of first and last substituents of
+        each restrained center; that pair is a 1-3 pair already excluded by
+        ``"angle"``, unless ``"angle"`` is dropped.
     random_seed
         Optional deterministic seed for initialization and HOOMD.
     write_gsd
@@ -137,6 +153,31 @@ class AllAtomDPDSettings:
         Prefix for optional GSD output.
     resname_map
         Residue label to three-character residue name map for RDKit/OpenFF export.
+    preserve_stereo
+        Whether to keep the handedness of tetrahedral centers through the DPD
+        run. Soft DPD repulsion otherwise lets atoms pass through a center and
+        invert it (MuPT-hub/mupt#116). When enabled, the handedness of each
+        center is recorded from the input coordinates (the residue templates,
+        with junction centers oriented by their templates' linkers), each center
+        is restrained by a periodic dihedral on its four substituents, and the
+        final coordinates are audited (see ``stereo_on_failure``).
+    stereo_centers
+        Which centers to preserve: ``"stereocenters"`` (RDKit potential
+        tetrahedral stereocenters, specified or not) or ``"all_tetrahedral"``
+        (every atom with four bonded neighbors, including CH2 and CH3 carbons,
+        whose inversion gives back the same molecule).
+    stereo_restraint_k
+        Force constant of each stereochemistry restraint
+        ``U = k/2 [1 - cos(phi - phi0)]``. The restraint must prevent inversion
+        outright, as stiff angle terms keep an inverted center from flipping
+        back; values far above the default can stall convergence.
+    stereo_planar_tolerance
+        Normalized substituent-tetrahedron volume below which a center counts as
+        near-planar, both in the reference (an error) and in the final audit.
+    stereo_on_failure
+        What to do when the final audit finds a center which did not keep its
+        handedness: ``"raise"`` a :class:`~mupt.chemistry.stereo.StereoInversionError`
+        without writing coordinates to the hierarchy, or ``"warn"`` and write them.
     """
 
     density_g_cm3: float = 0.85
@@ -168,6 +209,11 @@ class AllAtomDPDSettings:
     log_write_freq: Optional[int] = None
     output_name: Optional[str] = None
     resname_map: dict[str, str] = field(default_factory=dict)
+    preserve_stereo: bool = False
+    stereo_centers: str = "stereocenters"
+    stereo_restraint_k: float = 5000.0
+    stereo_planar_tolerance: float = 0.05
+    stereo_on_failure: str = "raise"
 
 
 @dataclass
@@ -650,6 +696,23 @@ class AllAtomDPDBuilder:
                 f"AA-DPD nlist_exclusions contains unsupported values: {unknown}."
             )
         self.settings.nlist_exclusions = exclusions
+        self._validate_stereo_settings()
+
+    def _validate_stereo_settings(self) -> None:
+        """Reject invalid stereochemistry-preservation settings."""
+        if self.settings.stereo_centers not in STEREO_CENTER_MODES:
+            raise ValueError(
+                f"AA-DPD stereo_centers must be one of {STEREO_CENTER_MODES}."
+            )
+        if self.settings.stereo_on_failure not in STEREO_FAILURE_MODES:
+            raise ValueError(
+                f"AA-DPD stereo_on_failure must be one of {STEREO_FAILURE_MODES}."
+            )
+        k = float(self.settings.stereo_restraint_k)
+        if not np.isfinite(k) or k <= 0.0:
+            raise ValueError("AA-DPD stereo_restraint_k must be positive and finite.")
+        if not 0.0 < float(self.settings.stereo_planar_tolerance) < 1.0:
+            raise ValueError("AA-DPD stereo_planar_tolerance must be between 0 and 1.")
 
     def _default_placement_generator(
         self, rng: np.random.Generator, box_length: float | np.ndarray
@@ -698,6 +761,13 @@ class AllAtomDPDBuilder:
             group for group in dihedrals if group in parameters.dihedral_type_by_group
         ]
         impropers = list(parameters.improper_type_by_group)
+        # captured before frame-0 placement, which only moves a copy of the
+        # hierarchy, so the reference reflects the input (template) coordinates
+        stereo_reference = (
+            self._capture_stereo_reference(root, records, atoms, bonds)
+            if self.settings.preserve_stereo
+            else None
+        )
         frame = self._initial_frame(
             gsd.hoomd.Frame,
             records,
@@ -710,8 +780,20 @@ class AllAtomDPDBuilder:
             parameters,
             box_lengths,
         )
+        stereo_params = (
+            self._append_stereo_dihedrals(frame, stereo_reference)
+            if stereo_reference is not None
+            else None
+        )
         simulation = self._simulation(
-            hoomd, frame, bonds, angles, dihedrals, impropers, parameters
+            hoomd,
+            frame,
+            bonds,
+            angles,
+            dihedrals,
+            impropers,
+            parameters,
+            stereo_params=stereo_params,
         )
         steps, elapsed_s, converged, diagnostics = self._run_until_converged(
             simulation,
@@ -720,13 +802,25 @@ class AllAtomDPDBuilder:
             parameters,
             box_lengths,
             bonds,
+            stereo_reference=stereo_reference,
         )
         final_positions = self._unwrap_positions(
             simulation.state.get_snapshot().particles.position[:],
             bonds,
             box_lengths,
         )
-        self._write_positions(root, atoms, final_positions)
+        stereo_report = (
+            check_stereo(
+                final_positions,
+                stereo_reference,
+                box_lengths=box_lengths,
+                planar_tolerance=self.settings.stereo_planar_tolerance,
+            )
+            if stereo_reference is not None
+            else None
+        )
+        if stereo_report is not None:
+            diagnostics["stereo"] = stereo_report.summary()
 
         particle_types = list(frame.particles.types)
         result = AllAtomDPDResult(
@@ -743,8 +837,186 @@ class AllAtomDPDBuilder:
             converged=converged,
             diagnostics=diagnostics,
         )
+        if stereo_report is not None:
+            self._enforce_stereo_report(stereo_report, result)
+        self._write_positions(root, atoms, final_positions)
         root.metadata["all_atom_dpd_summary"] = self._serializable_summary(result)
         return result
+
+    # Stereochemistry preservation
+    def _capture_stereo_reference(
+        self,
+        root: Primitive,
+        records: list[_SegmentRecord],
+        atoms: list[Primitive],
+        bonds: list[tuple[int, int]],
+    ) -> StereoReference:
+        """Record the handedness of the centers to preserve, in global atom order."""
+        degrees = np.zeros(len(atoms), dtype=int)
+        for i, j in bonds:
+            degrees[i] += 1
+            degrees[j] += 1
+
+        centers: Optional[list[int]] = None  # i.e. every tetrahedral center
+        if self.settings.stereo_centers == "stereocenters":
+            centers = []
+            for record, local_centers in zip(
+                records, self._perceive_stereocenters(root, records)
+            ):
+                for local_idx in local_centers:
+                    global_idx = record.local_to_global[local_idx]
+                    if degrees[global_idx] == 4:
+                        centers.append(global_idx)
+                    else:
+                        LOGGER.warning(
+                            "AA-DPD cannot preserve stereocenter at atom %s, which "
+                            "has %s bonded atoms (e.g. an uncapped chain end); "
+                            "skipping it.",
+                            global_idx,
+                            degrees[global_idx],
+                        )
+
+        reference = capture_stereo(
+            root,
+            atoms=atoms,
+            centers=centers,
+            planar_tolerance=self.settings.stereo_planar_tolerance,
+        )
+        LOGGER.info(
+            "AA-DPD preserving handedness of %s tetrahedral centers (%s).",
+            len(reference.centers),
+            self.settings.stereo_centers,
+        )
+        return reference
+
+    def _perceive_stereocenters(
+        self,
+        root: Primitive,
+        records: list[_SegmentRecord],
+    ) -> list[list[int]]:
+        """Local atom indices of the potential stereocenters of each segment."""
+        from ..interfaces.rdkit import primitive_to_rdkit_mols
+
+        rdkit_mols = list(
+            primitive_to_rdkit_mols(
+                root,
+                resname_map=self.settings.resname_map,
+                default_atom_position=np.zeros(3),
+            )
+        )
+        if len(rdkit_mols) != len(records):
+            raise ValueError(
+                "AA-DPD could not match RDKit segment molecules to SEGMENT records "
+                "for stereocenter perception."
+            )
+        # RDKit atoms follow the record's local atom order, with any linker
+        # atoms for unbonded Connectors appended after the record's own atoms
+        return [
+            [idx for idx in potential_stereocenters(mol) if idx < len(record.atoms)]
+            for mol, record in zip(rdkit_mols, records)
+        ]
+
+    def _append_stereo_dihedrals(
+        self, frame: Any, reference: StereoReference
+    ) -> dict[str, dict[str, float]]:
+        """Add a restraining dihedral per center to a frame, returning its parameters.
+
+        Each restraint acts on the four substituents (a, b, c, d) of a center as
+        ``U = k/2 [1 - cos(phi - phi0)]`` (HOOMD periodic dihedral with ``n=1``
+        and ``d=-1``), which, unlike a harmonic improper, selects a handedness.
+        Reference dihedrals are binned to whole degrees, so at most 360 dihedral
+        types are added however many centers are restrained.
+        """
+        container = frame.dihedrals
+        if not reference.centers:
+            return {}
+
+        num_existing = int(container.N or 0)
+        if num_existing:
+            types = list(container.types)
+            groups = np.asarray(container.group, dtype=np.uint32).reshape(-1, 4)
+            typeids = np.asarray(container.typeid, dtype=np.uint32)
+        else:  # drop any placeholder type left on an otherwise empty container
+            types = []
+            groups = np.zeros((0, 4), dtype=np.uint32)
+            typeids = np.zeros(0, dtype=np.uint32)
+
+        stereo_params: dict[str, dict[str, float]] = {}
+        new_typeids = []
+        for center in reference.centers:
+            phi0_deg = int(round(np.degrees(center.phi0))) % 360
+            name = f"{STEREO_RESTRAINT_TYPE_PREFIX}{phi0_deg:03d}"
+            if name not in stereo_params:
+                stereo_params[name] = {
+                    "k": float(self.settings.stereo_restraint_k),
+                    "d": -1,
+                    "n": 1,
+                    "phi0": float(np.radians(phi0_deg)),
+                }
+                types.append(name)
+            new_typeids.append(types.index(name))
+
+        container.types = types
+        container.group = np.concatenate([
+            groups,
+            np.array([center.neighbors for center in reference.centers], np.uint32),
+        ])
+        container.typeid = np.concatenate([
+            typeids,
+            np.array(new_typeids, dtype=np.uint32),
+        ])
+        container.N = num_existing + len(reference.centers)
+        return stereo_params
+
+    @staticmethod
+    def _stereo_restraint_count(container: Any) -> int:
+        """Number of stereochemistry restraint terms in a HOOMD dihedral container."""
+        types = getattr(container, "types", None)
+        typeids = getattr(container, "typeid", None)
+        if not types or typeids is None or not int(getattr(container, "N", 0) or 0):
+            return 0
+        return sum(
+            str(types[int(typeid)]).startswith(STEREO_RESTRAINT_TYPE_PREFIX)
+            for typeid in typeids
+        )
+
+    def _stereo_diagnostics(
+        self,
+        positions: np.ndarray,
+        reference: StereoReference,
+        box_lengths: np.ndarray,
+    ) -> dict[str, int]:
+        """Counts of centers which lost their handedness in (wrapped) positions."""
+        report = check_stereo(
+            positions,
+            reference,
+            box_lengths=box_lengths,
+            planar_tolerance=self.settings.stereo_planar_tolerance,
+        )
+        return {
+            "stereo_inverted": len(report.inverted),
+            "stereo_near_planar": len(report.near_planar),
+            "stereo_nonfinite": len(report.nonfinite),
+        }
+
+    def _enforce_stereo_report(
+        self, report: StereoReport, result: AllAtomDPDResult
+    ) -> None:
+        """Apply the configured failure policy to the final stereochemistry audit."""
+        if report.passed:
+            return
+        if self.settings.stereo_on_failure == "warn":
+            LOGGER.warning(
+                "AA-DPD did not preserve stereochemistry: inverted at atoms %s, "
+                "near-planar at atoms %s, nonfinite at atoms %s.",
+                report.inverted,
+                report.near_planar,
+                report.nonfinite,
+            )
+            return
+        error = StereoInversionError(report)
+        error.result = result  # for inspection; coordinates are NOT written
+        raise error
 
     def _segment_records(self, root: Primitive) -> list[_SegmentRecord]:
         """Return atom and bond records in role-aware traversal order."""
@@ -1268,8 +1540,14 @@ class AllAtomDPDBuilder:
         dihedrals: list[tuple[int, int, int, int]],
         impropers: list[tuple[int, int, int, int]],
         parameters: _ParameterTables,
+        stereo_params: Optional[dict[str, dict[str, float]]] = None,
     ) -> Any:
-        """Create and configure a HOOMD simulation from the initial frame."""
+        """Create and configure a HOOMD simulation from the initial frame.
+
+        Stereochemistry restraints (see ``_append_stereo_dihedrals``) share the
+        periodic dihedral force with OpenFF dihedrals, under their own types.
+        """
+        stereo_params = stereo_params or {}
         integrator = hoomd.md.Integrator(dt=self.settings.dt)
         integrator.methods.append(
             hoomd.md.methods.ConstantVolume(filter=hoomd.filter.All())
@@ -1294,9 +1572,12 @@ class AllAtomDPDBuilder:
                     "angle",
                 )
             integrator.forces.append(harmonic_angle)
-        if dihedrals:
+        if dihedrals or stereo_params:
             periodic = hoomd.md.dihedral.Periodic()
             for name in frame.dihedrals.types:
+                if name in stereo_params:
+                    periodic.params[name] = stereo_params[name]
+                    continue
                 periodic.params[name] = self._bonded_params_for(
                     name,
                     parameters.dihedral_params,
@@ -1430,6 +1711,12 @@ class AllAtomDPDBuilder:
             "dihedral": int(getattr(frame.dihedrals, "N", 0)),
             "improper": int(getattr(frame.impropers, "N", 0)),
         }
+        # NOTE: restraints share the dihedral force, so "dihedral_energy"
+        # includes their energy, while "dihedral" counts only OpenFF terms
+        num_stereo = cls._stereo_restraint_count(frame.dihedrals)
+        if num_stereo:
+            counts["dihedral"] -= num_stereo
+            counts["stereo_restraint"] = num_stereo
         diagnostics: dict[str, Any] = {"counts": counts}
         for kind in ("bond", "angle", "dihedral", "improper", "dpd"):
             energy = cls._force_energy(force_by_kind.get(kind))
@@ -1554,8 +1841,14 @@ class AllAtomDPDBuilder:
         parameters: _ParameterTables,
         box_lengths: np.ndarray,
         excluded_pairs: list[tuple[int, int]],
+        stereo_reference: Optional[StereoReference] = None,
     ) -> tuple[int, float, bool, dict[str, Any]]:
-        """Run HOOMD intervals until spacing and bonded energies converge."""
+        """Run HOOMD intervals until spacing and bonded energies converge.
+
+        If a stereochemistry reference is given, the number of centers which have
+        lost their handedness is also recorded at every check. This is reported
+        rather than required for convergence, as inverted centers do not recover.
+        """
         box_lengths = self._as_box_lengths(box_lengths)
         start = time.perf_counter()
         steps = 0
@@ -1571,34 +1864,35 @@ class AllAtomDPDBuilder:
 
         excluded = {tuple(sorted(pair)) for pair in excluded_pairs}
         self._initialize_diagnostics_log()
-        spacing_converged = self._spacing_ok(
-            simulation.state.get_snapshot(), freud, box_lengths, excluded
-        )
-        diagnostics = self._energy_diagnostics(
-            simulation, frame, parameters, self.settings
-        )
-        diagnostics["spacing_converged"] = bool(spacing_converged)
-        converged = self._convergence_ok(spacing_converged, diagnostics)
-        diagnostics["converged"] = bool(converged)
-        self._write_diagnostics_record(steps, diagnostics)
-        while not converged and steps < self.settings.n_steps_max:
-            simulation.run(self.settings.n_steps_per_interval)
-            steps += self.settings.n_steps_per_interval
-            spacing_converged = self._spacing_ok(
-                simulation.state.get_snapshot(), freud, box_lengths, excluded
-            )
+
+        def check() -> tuple[bool, dict[str, Any]]:
+            snapshot = simulation.state.get_snapshot()
+            spacing_converged = self._spacing_ok(snapshot, freud, box_lengths, excluded)
             diagnostics = self._energy_diagnostics(
                 simulation, frame, parameters, self.settings
             )
             diagnostics["spacing_converged"] = bool(spacing_converged)
+            if stereo_reference is not None:
+                diagnostics.update(
+                    self._stereo_diagnostics(
+                        snapshot.particles.position[:], stereo_reference, box_lengths
+                    )
+                )
             converged = self._convergence_ok(spacing_converged, diagnostics)
             diagnostics["converged"] = bool(converged)
             self._write_diagnostics_record(steps, diagnostics)
+            return converged, diagnostics
+
+        converged, diagnostics = check()
+        while not converged and steps < self.settings.n_steps_max:
+            simulation.run(self.settings.n_steps_per_interval)
+            steps += self.settings.n_steps_per_interval
+            converged, diagnostics = check()
             if steps % self.settings.report_interval == 0:
                 LOGGER.debug(
                     "Integrated %s all-atom DPD steps; spacing=%s bonded=%s",
                     steps,
-                    spacing_converged,
+                    diagnostics["spacing_converged"],
                     diagnostics.get("bonded_energy_converged"),
                 )
         frequency = self.settings.log_write_freq or self.settings.report_interval
